@@ -1,0 +1,111 @@
+# Internal environment used to hand data from launch_palettome_ui() to the
+# Shiny app in inst/app/ without making the core package depend on Shiny.
+.pt_env <- new.env(parent = emptyenv())
+
+#' Launch the interactive Palettome Shiny UI
+#'
+#' This is the *only* function in the package that requires UI packages
+#' (shiny, plotly, colourpicker, shinyjs). All of them are Suggests-only, so
+#' installing/loading the palettome package itself never requires them, and
+#' every other function ([detect_families()], [generate_palette()],
+#' [plot_palette_static()], [export_palette_json()], ...) works without
+#' them. If any are missing, this fails with a friendly message rather than
+#' an obscure error, and points out that the rest of the package still
+#' works.
+#'
+#' @param pdata A `palettome_data` object from [as_cluster_data()].
+#' @param families Optional: a `palettome_families` object (from
+#'   [detect_families()]) or a plain `cluster`/`family_id` data frame to
+#'   seed the initial grouping. If `NULL`, [detect_families()] is run with
+#'   `k`/`h`.
+#' @param session Optional: a `palettome_session` (e.g. loaded via
+#'   [import_palette_json()]) to resume editing, preserving prior manual
+#'   overrides. If `NULL`, a fresh harmonious palette is generated.
+#' @param k,h Passed to [detect_families()] when `families` is `NULL`.
+#' @param connectivity Optional cluster-by-cluster connectivity/distance
+#'   matrix passed to [detect_families()] and used for neighbor-aware
+#'   coloring; when `NULL`, cluster centroids are used instead.
+#' @param preview_max_n Passed to [downsample_stratified()] for the live
+#'   scatter plot; the full dataset is only used for the final PNG export.
+#' @param ... Passed on to `shiny::runApp()` (e.g. `launch.browser`, `port`).
+#' @return Invisibly, the edited `palettome_session` once the app closes
+#'   (via the "Done" button, or by interrupting R with Esc / Ctrl+C), so
+#'   `session <- launch_palettome_ui(...)` keeps every change made in the
+#'   UI. The app also shows the current colors as pasteable named-vector R
+#'   code.
+#' @export
+#' @examples
+#' cells <- data.frame(
+#'   x = rnorm(120, rep(c(0, 1, 6, 7, 3, 4), each = 20)),
+#'   y = rnorm(120, rep(c(0, 1, 0, 1, 6, 7), each = 20)),
+#'   cluster = rep(c("T1", "T2", "B1", "B2", "M1", "M2"), each = 20)
+#' )
+#' pdata <- as_cluster_data(cells, coord_cols = c("x", "y"), cluster_col = "cluster")
+#' if (interactive()) {
+#'   session <- launch_palettome_ui(pdata, k = 3)
+#'   cluster_colors(session)
+#' }
+launch_palettome_ui <- function(pdata, families = NULL, session = NULL,
+                                 k = NULL, h = NULL, connectivity = NULL,
+                                 preview_max_n = 50000, ...) {
+  required <- c("shiny", "plotly", "colourpicker", "shinyjs")
+  missing <- required[!vapply(required, requireNamespace, logical(1), quietly = TRUE)]
+  if (length(missing) > 0) {
+    stop(
+      "UI dependencies not installed: ", paste(missing, collapse = ", "), ".\n",
+      "Core functions (generate_palette(), detect_families(), ",
+      "plot_palette_static(), export_palette_json(), ...) remain fully ",
+      "usable without them -- this only affects the interactive UI.\n",
+      "Run install.packages(c(", paste(sprintf('"%s"', missing), collapse = ", "),
+      ")) to enable it.",
+      call. = FALSE
+    )
+  }
+  stopifnot(inherits(pdata, "palettome_data"))
+
+  centroids <- compute_centroids(pdata)
+
+  fam_result <- if (!is.null(families)) {
+    if (inherits(families, "palettome_families")) {
+      families
+    } else {
+      structure(
+        list(
+          assignment = families, method = "explicit", dendro = NULL,
+          neighbors = if (!is.null(connectivity)) connectivity else centroids
+        ),
+        class = "palettome_families"
+      )
+    }
+  } else {
+    detect_families(pdata, k = k, h = h, connectivity = connectivity)
+  }
+
+  neighbors <- fam_result$neighbors %||% centroids
+  init_session <- session %||% generate_palette(
+    fam_result$assignment,
+    mode = "harmonious", seed = 1, neighbors = neighbors,
+    n_cells = centroids[, c("cluster", "n_cells")]
+  )
+
+  assign("pdata", pdata, envir = .pt_env)
+  assign("centroids", centroids, envir = .pt_env)
+  assign("neighbors", neighbors, envir = .pt_env)
+  assign("assignment", fam_result$assignment, envir = .pt_env)
+  assign("dendro", fam_result$dendro, envir = .pt_env)
+  assign("session", init_session, envir = .pt_env)
+  assign("preview_max_n", preview_max_n, envir = .pt_env)
+
+  app_dir <- system.file("app", package = "palettome")
+  if (!nzchar(app_dir)) {
+    # Running from a source checkout (not yet installed as a package).
+    app_dir <- file.path(getwd(), "inst", "app")
+  }
+  if (!file.exists(file.path(app_dir, "app.R"))) {
+    stop("Could not locate the Shiny app directory (looked in: ", app_dir, ")", call. = FALSE)
+  }
+  # The app keeps .pt_env$session in sync with every edit, so an
+  # interrupt (Esc / Ctrl+C) still hands back the latest state.
+  result <- tryCatch(shiny::runApp(app_dir, ...), interrupt = function(e) NULL)
+  invisible(if (inherits(result, "palettome_session")) result else .pt_env$session)
+}
